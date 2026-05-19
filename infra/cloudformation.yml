@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cloud Platform Automation Demo — provisions EC2, S3, IAM role, security group,
+  CloudWatch log group, and a metric filter. Uses default VPC for simplicity.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cloud-platform-demo
+    Description: Tag prefix applied to all resources.
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type (t2.micro is free-tier eligible).
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access.
+
+  AllowedCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to reach the app on port 8000. Restrict in production.
+
+  # Latest Amazon Linux 2023 AMI — update per region as needed
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # --- IAM ------------------------------------------------------------------
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/platform/${ProjectName}:*"
+        - PolicyName: S3ArtifactAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-instance-profile"
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # --- Security Group -------------------------------------------------------
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP on app port and SSH
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: !Ref AllowedCIDR
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --- S3 -------------------------------------------------------------------
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --- CloudWatch -----------------------------------------------------------
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/platform/${ProjectName}"
+      RetentionInDays: 7
+
+  ErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AppLogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricName: ApplicationErrors
+          MetricNamespace: !Sub "${ProjectName}/App"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-error-alarm"
+      AlarmDescription: Fires when the app logs an ERROR within a 5-minute window.
+      Namespace: !Sub "${ProjectName}/App"
+      MetricName: ApplicationErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # --- EC2 ------------------------------------------------------------------
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroups:
+        - !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-app"
+        - Key: Project
+          Value: !Ref ProjectName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          yum update -y
+          yum install -y docker git
+
+          # Start Docker
+          systemctl enable docker
+          systemctl start docker
+
+          # Clone repo and build image on EC2 (avoids ECR complexity)
+          git clone https://github.com/YOUR_GITHUB_USERNAME/cloud-platform-automation-aws.git /opt/app
+          cd /opt/app
+          docker build -t cloud-platform-service:latest .
+
+          # Run container; pipe stdout to CloudWatch via awslogs driver
+          docker run -d \
+            --name cloud-platform-service \
+            --restart unless-stopped \
+            -p 8000:8000 \
+            --log-driver=awslogs \
+            --log-opt awslogs-region=${AWS::Region} \
+            --log-opt awslogs-group=/platform/${ProjectName} \
+            --log-opt awslogs-stream=ec2-app \
+            cloud-platform-service:latest
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  InstancePublicIP:
+    Description: Public IP of the EC2 instance
+    Value: !GetAtt AppInstance.PublicIp
+
+  ServiceURL:
+    Description: Base URL for the running service
+    Value: !Sub "http://${AppInstance.PublicIp}:8000"
+
+  HealthCheckURL:
+    Description: Health check endpoint
+    Value: !Sub "http://${AppInstance.PublicIp}:8000/health"
+
+  LogGroupName:
+    Description: CloudWatch log group receiving container stdout
+    Value: !Ref AppLogGroup
+
+  ArtifactBucketName:
+    Description: S3 bucket for deployment artifacts
+    Value: !Ref ArtifactBucket

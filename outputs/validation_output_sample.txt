@@ -1,0 +1,8 @@
+Validating deployment at: http://54.210.88.12:8000
+==================================================
+  [PASS] Health Check (/health)
+  [PASS] Readiness Check (/ready)
+  [PASS] Metrics (/metrics)
+==================================================
+Result: 3/3 checks passed
+Status: ALL CHECKS PASSED

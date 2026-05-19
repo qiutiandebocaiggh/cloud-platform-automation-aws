@@ -1,0 +1,7 @@
+{
+  "status": "healthy",
+  "service": "cloud-platform-service",
+  "version": "1.0.0",
+  "timestamp": "2024-06-01T14:22:05.312487+00:00",
+  "uptime_seconds": 47.3
+}
