@@ -99,7 +99,7 @@ async def simulate_error():
             "endpoint": "/simulate-error",
             "status_code": 500,
             "error_type": "SimulatedError",
-            "message": "This is a controlled error for demo purposes",
+            "error_detail": "This is a controlled error for demo purposes",
         },
     )
 
